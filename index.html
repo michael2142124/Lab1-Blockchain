@@ -13,7 +13,7 @@
   header { background:var(--brand); color:#fff; padding:20px 16px; text-align:center; }
   header h1 { margin:0 0 4px; font-size:1.6rem; }
   header p { margin:0; opacity:.85; }
-  main { max-width:900px; margin:0 auto; padding:16px; }
+  main { max-width:1100px; margin:0 auto; padding:16px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
           padding:16px; margin-bottom:16px; }
   h2 { margin:0 0 12px; font-size:1.15rem; }
@@ -32,8 +32,10 @@
   /* Table scrolls sideways on small phone screens */
   .table-wrap { overflow-x:auto; }
   table { width:100%; border-collapse:collapse; min-width:560px; }
+  table.wide { min-width:900px; }
   th, td { text-align:left; padding:8px; border-bottom:1px solid var(--line); vertical-align:middle; }
   th { color:var(--muted); font-weight:600; font-size:.85rem; }
+  .addr { font-family: ui-monospace, Consolas, monospace; font-size:.72rem; word-break:break-all; }
   .badge { padding:2px 8px; border-radius:99px; font-size:.8rem; font-weight:600; }
   .Open { background:#e7f5ff; color:#1864ab; }
   .Accepted { background:#fff3bf; color:#7c5e00; }
@@ -81,9 +83,9 @@
   <div class="card">
     <h2>Transaction history</h2>
     <div class="table-wrap">
-      <table>
-        <thead><tr><th>Action</th><th>Request</th><th>Wallet</th><th>Amount</th><th>Transaction</th></tr></thead>
-        <tbody id="history"><tr><td colspan="5" class="muted">Connect your wallet to load history.</td></tr></tbody>
+      <table class="wide">
+        <thead><tr><th>Action</th><th>Request</th><th>From (who sent it)</th><th>To</th><th>Amount</th><th>Transaction</th></tr></thead>
+        <tbody id="history"><tr><td colspan="6" class="muted">Connect your wallet to load history.</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -95,6 +97,10 @@
 //  EDIT ME: paste your deployed TutorTrust contract address here
 // =====================================================================
 const CONTRACT_ADDRESS = "0x23F8FB8e3c42E6672012D1B21d0F5e77dAE9C959";
+
+// OPTIONAL: the block number where your contract was created (see it on Etherscan
+// on the contract's creation transaction). Leave 0 to scan only the last ~200,000 blocks.
+const DEPLOY_BLOCK = 0;
 // =====================================================================
 
 const SEPOLIA_CHAIN_ID = 11155111;     // Sepolia network id
@@ -214,48 +220,82 @@ async function loadRequests() {
 }
 
 // ---------- Transaction history (read from the contract's event log) ----------
-const HISTORY_EVENTS = [
-  ["RequestPosted",   "Posted"],
-  ["RequestAccepted", "Accepted"],
-  ["PaymentReleased", "Payment released"],
-  ["RequestCancelled","Cancelled"]
-];
+const EVENT_LABELS = {
+  RequestPosted:    "Posted (payment locked)",
+  RequestAccepted:  "Accepted by tutor",
+  PaymentReleased:  "Payment released",
+  RequestCancelled: "Cancelled (refunded)"
+};
 
 async function loadHistory() {
   const body = $("history");
   try {
-    // Fetch every event type from block 0 onward, then merge into one list.
-    const lists = await Promise.all(HISTORY_EVENTS.map(([name]) => contract.queryFilter(name, 0)));
+    // The wallet's network connection only allows 10,000 blocks per search,
+    // so we search in chunks of 9,999 blocks and join the results.
+    const latest = await provider.getBlockNumber();
+    const start = DEPLOY_BLOCK > 0 ? DEPLOY_BLOCK : Math.max(0, latest - 200000);
+    const ranges = [];
+    for (let from = start; from <= latest; from += 10000) ranges.push([from, Math.min(from + 9999, latest)]);
+
+    const logs = [];
+    for (let i = 0; i < ranges.length; i += 5) {          // 5 chunks at a time
+      const batch = await Promise.all(ranges.slice(i, i + 5).map(([f, t]) =>
+        provider.getLogs({ address: CONTRACT_ADDRESS, fromBlock: f, toBlock: t })));
+      batch.forEach((list) => logs.push(...list));
+    }
+
+    // Turn raw logs into readable events, oldest first.
     const events = [];
-    lists.forEach((list, i) => list.forEach((ev) => events.push({ ev, label: HISTORY_EVENTS[i][1] })));
-    events.sort((a, b) => a.ev.blockNumber - b.ev.blockNumber || a.ev.index - b.ev.index); // oldest first
+    for (const log of logs) {
+      const parsed = contract.interface.parseLog(log);
+      if (parsed) events.push({ log, name: parsed.name, args: parsed.args });
+    }
+    events.sort((a, b) => a.log.blockNumber - b.log.blockNumber || a.log.index - b.log.index);
 
     body.innerHTML = "";
     if (events.length === 0) {
-      body.innerHTML = '<tr><td colspan="5" class="muted">No transactions yet.</td></tr>';
+      body.innerHTML = '<tr><td colspan="6" class="muted">No transactions found' +
+        (DEPLOY_BLOCK > 0 ? "." : " in the last 200,000 blocks. Set DEPLOY_BLOCK in the code if yours is older.") + "</td></tr>";
       return;
     }
-    for (const { ev, label } of events) {
-      const a = ev.args;
-      const who = a.student || a.tutor;            // whichever wallet this event is about
+
+    // Look up each request and each transaction sender once, then reuse.
+    const reqCache = {}, txCache = {};
+    for (const { log, args } of events) {
+      const id = args.id.toString();
+      if (!reqCache[id]) reqCache[id] = await contract.requests(id);
+      if (!txCache[log.transactionHash]) txCache[log.transactionHash] = (await provider.getTransaction(log.transactionHash)).from;
+    }
+
+    for (const { log, name, args } of events) {
+      const req = reqCache[args.id.toString()];
+      const sender = txCache[log.transactionHash];
+      let to;
+      if (name === "RequestPosted")   to = CONTRACT_ADDRESS;   // money goes into escrow
+      if (name === "RequestAccepted") to = req.student;        // tutor accepts the student's request
+      if (name === "PaymentReleased") to = args.tutor;         // student pays the tutor
+      if (name === "RequestCancelled") to = args.student;      // refund goes back to the student
+      const amount = args.amount !== undefined ? args.amount : req.amount;
+
       const tr = document.createElement("tr");
-      const cell = (text) => { const td = document.createElement("td"); td.textContent = text; tr.appendChild(td); return td; };
-      cell(label);
-      cell("#" + a.id);
-      cell(who.slice(0, 6) + "…" + who.slice(-4));
-      cell(a.amount !== undefined ? ethers.formatEther(a.amount) + " ETH" : "-");
+      const cell = (text, cls) => { const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); return td; };
+      cell(EVENT_LABELS[name] || name);
+      cell("#" + args.id);
+      cell(sender, "addr");
+      cell(to === CONTRACT_ADDRESS ? to + " (escrow contract)" : to, "addr");
+      cell(ethers.formatEther(amount) + " ETH");   // exact amount, no rounding
       const link = document.createElement("a");
-      link.href = "https://sepolia.etherscan.io/tx/" + ev.transactionHash;
+      link.href = "https://sepolia.etherscan.io/tx/" + log.transactionHash;
       link.target = "_blank";
       link.rel = "noopener";
-      link.textContent = ev.transactionHash.slice(0, 10) + "…" + ev.transactionHash.slice(-6);
+      link.textContent = log.transactionHash.slice(0, 10) + "…" + log.transactionHash.slice(-6);
       cell("").appendChild(link);
       body.appendChild(tr);
     }
   } catch (err) {
     body.innerHTML = "";
     const td = document.createElement("td");
-    td.colSpan = 5;
+    td.colSpan = 6;
     td.className = "muted";
     td.textContent = "Could not load history: " + friendlyError(err);
     const tr = document.createElement("tr");
@@ -273,7 +313,7 @@ function buildRow(id, r) {
   const cell = (text) => { const td = document.createElement("td"); td.textContent = text; tr.appendChild(td); return td; };
   cell(id);
   cell(r.subject);
-  cell(ethers.formatEther(r.amount) + " ETH");
+  cell(ethers.formatEther(r.amount) + " ETH");   // exact amount, no rounding
   const statusTd = cell("");
   const badge = document.createElement("span");
   badge.className = "badge " + status;
@@ -303,7 +343,7 @@ async function sendTx(label, action) {
     showStatus(label + ": sent, waiting for confirmation…", "", tx.hash);
     await tx.wait();                                             // wait until it is mined
     showStatus(label + ": confirmed!", "good", tx.hash);
-    await loadRequests();                                        // refresh the table
+    await loadRequests();                                        // refresh the tables
   } catch (err) {
     showStatus(label + " failed: " + friendlyError(err), "error");
   }
