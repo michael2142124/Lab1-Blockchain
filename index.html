@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TutorTrust</title>
+<style>
+  /* ---------- Basic look ---------- */
+  :root { --brand:#3b5bdb; --bg:#f4f6fb; --card:#fff; --text:#1d2433; --muted:#6b7385; --line:#e3e7f0; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+         background:var(--bg); color:var(--text); line-height:1.4; }
+  header { background:var(--brand); color:#fff; padding:20px 16px; text-align:center; }
+  header h1 { margin:0 0 4px; font-size:1.6rem; }
+  header p { margin:0; opacity:.85; }
+  main { max-width:900px; margin:0 auto; padding:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
+          padding:16px; margin-bottom:16px; }
+  h2 { margin:0 0 12px; font-size:1.15rem; }
+  input { width:100%; padding:10px; margin-bottom:10px; border:1px solid var(--line);
+          border-radius:8px; font-size:1rem; }
+  button { background:var(--brand); color:#fff; border:0; border-radius:8px; padding:10px 16px;
+           font-size:.95rem; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  button.small { padding:6px 10px; font-size:.85rem; margin:2px 4px 2px 0; }
+  button.danger { background:#c92a2a; }
+  button.ok { background:#2b8a3e; }
+  #status { padding:12px; border-radius:8px; background:#eef2ff; display:none; word-break:break-word; }
+  #status.error { background:#ffe3e3; color:#8a1c1c; }
+  #status.good { background:#d3f9d8; color:#1b5e20; }
+  .muted { color:var(--muted); font-size:.9rem; }
+  /* Table scrolls sideways on small phone screens */
+  .table-wrap { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; min-width:560px; }
+  th, td { text-align:left; padding:8px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  th { color:var(--muted); font-weight:600; font-size:.85rem; }
+  .badge { padding:2px 8px; border-radius:99px; font-size:.8rem; font-weight:600; }
+  .Open { background:#e7f5ff; color:#1864ab; }
+  .Accepted { background:#fff3bf; color:#7c5e00; }
+  .Paid { background:#d3f9d8; color:#1b5e20; }
+  .Cancelled { background:#e9ecef; color:#495057; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>TutorTrust</h1>
+  <p>Peer-tutoring escrow on Ethereum Sepolia</p>
+</header>
+
+<main>
+  <!-- Step 1: connect wallet -->
+  <div class="card">
+    <button id="connectBtn">Connect MetaMask</button>
+    <span id="account" class="muted"></span>
+  </div>
+
+  <!-- Step 2: post a request -->
+  <div class="card">
+    <h2>Post a tutoring request</h2>
+    <input id="subject" type="text" placeholder="Subject (e.g. Calculus midterm review)">
+    <input id="payment" type="number" step="any" min="0" placeholder="Payment in ETH (e.g. 0.01)">
+    <button id="postBtn" disabled>Post request &amp; lock payment</button>
+  </div>
+
+  <!-- Transaction status messages appear here -->
+  <div class="card" id="statusCard" style="display:none"><div id="status"></div></div>
+
+  <!-- Step 3: table of all requests -->
+  <div class="card">
+    <h2>All requests <button class="small" id="refreshBtn" style="float:right">Refresh</button></h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>ID</th><th>Subject</th><th>Payment</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody id="rows"><tr><td colspan="5" class="muted">Connect your wallet to load requests.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.17.0/ethers.umd.min.js"></script>
+<script>
+// =====================================================================
+//  EDIT ME: paste your deployed TutorTrust contract address here
+// =====================================================================
+const CONTRACT_ADDRESS = "0x23F8FB8e3c42E6672012D1B21d0F5e77dAE9C959";
+// =====================================================================
+
+const SEPOLIA_CHAIN_ID = 11155111;     // Sepolia network id
+const SEPOLIA_HEX      = "0xaa36a7";   // same number in hex (MetaMask wants hex)
+const STATUS_NAMES = ["Open", "Accepted", "Paid", "Cancelled"]; // contract's uint8 -> words
+
+// The "menu" of contract functions this page is allowed to call.
+const ABI = [
+  "function requestCount() view returns (uint256)",
+  "function requests(uint256) view returns (address student, address tutor, uint256 amount, string subject, uint8 status)",
+  "function postRequest(string subject) payable returns (uint256)",
+  "function acceptRequest(uint256 id)",
+  "function releasePayment(uint256 id)",
+  "function cancelRequest(uint256 id)"
+];
+
+let provider, signer, contract, myAddress; // filled in after connecting
+const $ = (id) => document.getElementById(id); // shortcut for finding page elements
+
+// ---------- Status box helpers ----------
+// kind: "" (info), "good" (success) or "error". If a txHash is given, show an Etherscan link.
+function showStatus(message, kind = "", txHash = null) {
+  $("statusCard").style.display = "block";
+  const box = $("status");
+  box.style.display = "block";
+  box.className = kind;
+  box.textContent = message;
+  if (txHash) {
+    box.append(" ");
+    const a = document.createElement("a");
+    a.href = "https://sepolia.etherscan.io/tx/" + txHash;
+    a.target = "_blank";
+    a.rel = "noopener";
+    a.textContent = "View on Etherscan";
+    box.append(a);
+  }
+}
+
+// Turn a scary error object into a short, friendly sentence.
+function friendlyError(err) {
+  if (err && err.code === "ACTION_REJECTED") return "You rejected the transaction in MetaMask.";
+  return (err && (err.reason || err.shortMessage || err.message)) || "Something went wrong.";
+}
+
+// ---------- Connect wallet ----------
+async function connect() {
+  if (!window.ethereum) { showStatus("MetaMask not found. Please install it first.", "error"); return; }
+  try {
+    provider = new ethers.BrowserProvider(window.ethereum);
+    await provider.send("eth_requestAccounts", []);        // asks the user to approve the connection
+
+    // Network guard: make sure we are on Sepolia, otherwise ask the wallet to switch.
+    const net = await provider.getNetwork();
+    if (net.chainId !== BigInt(SEPOLIA_CHAIN_ID)) {
+      try {
+        await provider.send("wallet_switchEthereumChain", [{ chainId: SEPOLIA_HEX }]);
+      } catch (e) {
+        showStatus("Please switch MetaMask to the Sepolia test network.", "error");
+        return;
+      }
+      provider = new ethers.BrowserProvider(window.ethereum); // fresh provider on the new network
+    }
+
+    signer = await provider.getSigner();
+    myAddress = (await signer.getAddress()).toLowerCase();
+    contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
+
+    $("account").textContent = " Connected: " + myAddress.slice(0, 6) + "…" + myAddress.slice(-4);
+    $("connectBtn").textContent = "Connected";
+    $("postBtn").disabled = false;
+    showStatus("Wallet connected on Sepolia.", "good");
+    await loadRequests();
+  } catch (err) {
+    showStatus(friendlyError(err), "error");
+  }
+}
+
+// ---------- Read all requests and draw the table ----------
+async function loadRequests() {
+  if (!contract) return;
+  const rows = $("rows");
+  try {
+    // Ask the contract how many requests exist. If it has no requestCount(),
+    // fall back to reading requests(0), requests(1)... until one fails.
+    let count;
+    try { count = Number(await contract.requestCount()); }
+    catch (e) {
+      count = 0;
+      while (true) {
+        try { await contract.requests(count); count++; } catch (e2) { break; }
+      }
+    }
+
+    rows.innerHTML = "";
+    if (count === 0) {
+      rows.innerHTML = '<tr><td colspan="5" class="muted">No requests yet. Post the first one!</td></tr>';
+      return;
+    }
+    for (let id = 0; id < count; id++) {
+      const r = await contract.requests(id);
+      rows.appendChild(buildRow(id, r));
+    }
+  } catch (err) {
+    showStatus("Could not load requests: " + friendlyError(err), "error");
+  }
+}
+
+// Build one table row. Text goes in via textContent so nobody can inject HTML through the subject.
+function buildRow(id, r) {
+  const status  = STATUS_NAMES[Number(r.status)];
+  const isStudent = r.student.toLowerCase() === myAddress;
+  const tr = document.createElement("tr");
+
+  const cell = (text) => { const td = document.createElement("td"); td.textContent = text; tr.appendChild(td); return td; };
+  cell(id);
+  cell(r.subject);
+  cell(ethers.formatEther(r.amount) + " ETH");
+  const statusTd = cell("");
+  const badge = document.createElement("span");
+  badge.className = "badge " + status;
+  badge.textContent = status;
+  statusTd.appendChild(badge);
+
+  // Only show the buttons this user is actually allowed to use.
+  const actionsTd = cell("");
+  const addBtn = (label, cls, fn) => {
+    const b = document.createElement("button");
+    b.className = "small " + cls;
+    b.textContent = label;
+    b.onclick = () => sendTx(label, () => fn(id));
+    actionsTd.appendChild(b);
+  };
+  if (status === "Open" && !isStudent) addBtn("Accept", "", (i) => contract.acceptRequest(i));
+  if (status === "Accepted" && isStudent) addBtn("Release payment", "ok", (i) => contract.releasePayment(i));
+  if (status === "Open" && isStudent) addBtn("Cancel", "danger", (i) => contract.cancelRequest(i));
+  return tr;
+}
+
+// ---------- Send any transaction and report progress ----------
+async function sendTx(label, action) {
+  try {
+    showStatus(label + ": please confirm in MetaMask…");
+    const tx = await action();                                   // user signs; tx is sent
+    showStatus(label + ": sent, waiting for confirmation…", "", tx.hash);
+    await tx.wait();                                             // wait until it is mined
+    showStatus(label + ": confirmed!", "good", tx.hash);
+    await loadRequests();                                        // refresh the table
+  } catch (err) {
+    showStatus(label + " failed: " + friendlyError(err), "error");
+  }
+}
+
+// ---------- Post a new request ----------
+async function post() {
+  const subject = $("subject").value.trim();
+  const payment = $("payment").value.trim();
+  if (!subject) { showStatus("Please enter a subject.", "error"); return; }
+  let value;
+  try { value = ethers.parseEther(payment); } catch (e) { showStatus("Please enter a valid ETH amount.", "error"); return; }
+  if (value <= 0n) { showStatus("Payment must be greater than zero.", "error"); return; }
+
+  await sendTx("Post request", () => contract.postRequest(subject, { value }));
+  $("subject").value = "";
+  $("payment").value = "";
+}
+
+// ---------- Wire up buttons ----------
+$("connectBtn").onclick = connect;
+$("postBtn").onclick = post;
+$("refreshBtn").onclick = loadRequests;
+
+// If the user changes account or network in MetaMask, reload to avoid stale data.
+if (window.ethereum) {
+  window.ethereum.on("accountsChanged", () => location.reload());
+  window.ethereum.on("chainChanged", () => location.reload());
+}
+</script>
+</body>
+</html>
