@@ -76,6 +76,17 @@
       </table>
     </div>
   </div>
+
+  <!-- Step 4: every transaction ever made on this contract, read from its event log -->
+  <div class="card">
+    <h2>Transaction history</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Action</th><th>Request</th><th>Wallet</th><th>Amount</th><th>Transaction</th></tr></thead>
+        <tbody id="history"><tr><td colspan="5" class="muted">Connect your wallet to load history.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
 </main>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.17.0/ethers.umd.min.js"></script>
@@ -97,7 +108,12 @@ const ABI = [
   "function postRequest(string subject) payable returns (uint256)",
   "function acceptRequest(uint256 id)",
   "function releasePayment(uint256 id)",
-  "function cancelRequest(uint256 id)"
+  "function cancelRequest(uint256 id)",
+  // Events: the contract's "receipts", used to build the transaction history table
+  "event RequestPosted(uint256 indexed id, address indexed student, uint256 amount, string subject)",
+  "event RequestAccepted(uint256 indexed id, address indexed tutor)",
+  "event PaymentReleased(uint256 indexed id, address indexed tutor, uint256 amount)",
+  "event RequestCancelled(uint256 indexed id, address indexed student, uint256 amount)"
 ];
 
 let provider, signer, contract, myAddress; // filled in after connecting
@@ -124,8 +140,13 @@ function showStatus(message, kind = "", txHash = null) {
 
 // Turn a scary error object into a short, friendly sentence.
 function friendlyError(err) {
-  if (err && err.code === "ACTION_REJECTED") return "You rejected the transaction in MetaMask.";
-  return (err && (err.reason || err.shortMessage || err.message)) || "Something went wrong.";
+  // ethers sometimes hides MetaMask's real error inside err.info.error or err.error
+  const inner = (err && ((err.info && err.info.error) || err.error)) || err || {};
+  const code = inner.code !== undefined ? inner.code : (err && err.code);
+  if (code === "ACTION_REJECTED" || code === 4001) return "You rejected the request in MetaMask.";
+  if (code === -32002) return "MetaMask already has a pending request. Open the MetaMask extension, approve or close it, then try again.";
+  const short = err && err.shortMessage && !err.shortMessage.startsWith("could not coalesce") ? err.shortMessage : null;
+  return (err && err.reason) || short || inner.message || "Something went wrong. Check the browser console (F12) for details.";
 }
 
 // ---------- Connect wallet ----------
@@ -164,6 +185,7 @@ async function connect() {
 // ---------- Read all requests and draw the table ----------
 async function loadRequests() {
   if (!contract) return;
+  loadHistory();                       // refresh the transaction history too
   const rows = $("rows");
   try {
     // Ask the contract how many requests exist. If it has no requestCount(),
@@ -188,6 +210,57 @@ async function loadRequests() {
     }
   } catch (err) {
     showStatus("Could not load requests: " + friendlyError(err), "error");
+  }
+}
+
+// ---------- Transaction history (read from the contract's event log) ----------
+const HISTORY_EVENTS = [
+  ["RequestPosted",   "Posted"],
+  ["RequestAccepted", "Accepted"],
+  ["PaymentReleased", "Payment released"],
+  ["RequestCancelled","Cancelled"]
+];
+
+async function loadHistory() {
+  const body = $("history");
+  try {
+    // Fetch every event type from block 0 onward, then merge into one list.
+    const lists = await Promise.all(HISTORY_EVENTS.map(([name]) => contract.queryFilter(name, 0)));
+    const events = [];
+    lists.forEach((list, i) => list.forEach((ev) => events.push({ ev, label: HISTORY_EVENTS[i][1] })));
+    events.sort((a, b) => a.ev.blockNumber - b.ev.blockNumber || a.ev.index - b.ev.index); // oldest first
+
+    body.innerHTML = "";
+    if (events.length === 0) {
+      body.innerHTML = '<tr><td colspan="5" class="muted">No transactions yet.</td></tr>';
+      return;
+    }
+    for (const { ev, label } of events) {
+      const a = ev.args;
+      const who = a.student || a.tutor;            // whichever wallet this event is about
+      const tr = document.createElement("tr");
+      const cell = (text) => { const td = document.createElement("td"); td.textContent = text; tr.appendChild(td); return td; };
+      cell(label);
+      cell("#" + a.id);
+      cell(who.slice(0, 6) + "…" + who.slice(-4));
+      cell(a.amount !== undefined ? ethers.formatEther(a.amount) + " ETH" : "-");
+      const link = document.createElement("a");
+      link.href = "https://sepolia.etherscan.io/tx/" + ev.transactionHash;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = ev.transactionHash.slice(0, 10) + "…" + ev.transactionHash.slice(-6);
+      cell("").appendChild(link);
+      body.appendChild(tr);
+    }
+  } catch (err) {
+    body.innerHTML = "";
+    const td = document.createElement("td");
+    td.colSpan = 5;
+    td.className = "muted";
+    td.textContent = "Could not load history: " + friendlyError(err);
+    const tr = document.createElement("tr");
+    tr.appendChild(td);
+    body.appendChild(tr);
   }
 }
 
